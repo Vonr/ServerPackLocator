@@ -7,7 +7,7 @@
     "BrandingControlMixin"
   ],
   "client": [
-    "client.MinecraftMixin"
+    "client.GuiMixin"
   ],
   "server": [],
   "injectors": {
