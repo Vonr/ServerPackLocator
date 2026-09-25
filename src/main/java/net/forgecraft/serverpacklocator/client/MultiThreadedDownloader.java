@@ -1,31 +1,39 @@
 package net.forgecraft.serverpacklocator.client;
 
 import com.google.common.hash.HashCode;
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.ByteBufInputStream;
+import io.netty.buffer.Unpooled;
 import net.forgecraft.serverpacklocator.FileChecksumValidator;
 import net.forgecraft.serverpacklocator.ServerManifest;
 import net.forgecraft.serverpacklocator.secure.IConnectionSecurityManager;
+import net.forgecraft.serverpacklocator.utils.CompressionUtils;
 import net.neoforged.fml.loading.progress.StartupNotificationManager;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.net.URI;
 import java.net.URLEncoder;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.ByteBuffer;
+import java.nio.channels.Channels;
+import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
-import java.util.Base64;
 import java.util.List;
 import java.util.Objects;
 import java.util.OptionalLong;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.Flow;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Function;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
@@ -96,6 +104,7 @@ public class MultiThreadedDownloader {
         LOGGER.info("ServerPackLocator is requesting {}...", requestUri);
 
         var request = HttpRequest.newBuilder(requestUri);
+        request.header("Accept-Encoding", "gzip");
         this.connectionSecurityManager.decorateClientRequest(request, authenticated);
         var response = httpClient.send(request.build(), bodyHandler);
         this.connectionSecurityManager.handleClientResponse(response);
@@ -265,9 +274,29 @@ public class MultiThreadedDownloader {
         makeRequest(
                 "files/" + URLEncoder.encode(nextFile, StandardCharsets.UTF_8).replace("+", "%20"),
                 true,
-                progressListener.trackBodyHandler(
-                        HttpResponse.BodyHandlers.ofFile(destinationPath, StandardOpenOption.WRITE, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING)
-                )
+                progressListener.trackBodyHandler((HttpResponse.BodyHandler<Path>) responseInfo -> {
+                    Function<InputStream, InputStream> decompressor = s -> s;
+                    var encoding = responseInfo.headers().firstValue("Content-Encoding").orElse(null);
+                    if (encoding != null) {
+                        var methodNames = encoding.split(",");
+                        for (int i = methodNames.length - 1; i >= 0; i--) {
+                            var method = CompressionUtils.methodFromName(methodNames[i].trim());
+                            if (method != null) {
+                                decompressor = decompressor.andThen(s -> {
+                                    try {
+                                        return method.decompress(s);
+                                    } catch (IOException e) {
+                                        throw new RuntimeException(e);
+                                    }
+                                });
+                            }
+                        }
+                    }
+
+                    int initialCapacity = (int) fileToDownload.size();
+
+                    return new CompressedFileSubscriber(fileToDownload, decompressor, initialCapacity);
+                })
         );
 
         // Validate that the downloaded file actually matches the expected checksum
@@ -324,6 +353,93 @@ public class MultiThreadedDownloader {
         }
 
         void onProgress(long downloaded, long expectedSize);
+    }
+
+    static class CompressedFileSubscriber implements HttpResponse.BodySubscriber<Path> {
+        /**
+         * Adapted from {@link jdk.internal.net.http.ResponseSubscribers.PathSubscriber}
+         */
+
+        private final FileToDownload file;
+        private final Function<InputStream, InputStream> decompressor;
+
+        private final ByteBuf fullBuf;
+        private final CompletableFuture<Path> result = new CompletableFuture<>();
+
+        private final AtomicBoolean subscribed = new AtomicBoolean();
+        private volatile Flow.Subscription subscription;
+        private volatile FileChannel out;
+
+        CompressedFileSubscriber(FileToDownload file, Function<InputStream, InputStream> decompressor, int initialCapacity) {
+            this.file = file;
+            this.decompressor = decompressor;
+            this.fullBuf = Unpooled.directBuffer(initialCapacity);
+        }
+
+        @Override
+        public void onSubscribe(Flow.Subscription subscription) {
+            Objects.requireNonNull(subscription);
+            if (!subscribed.compareAndSet(false, true)) {
+                subscription.cancel();
+                return;
+            }
+
+            this.subscription = subscription;
+            try {
+                out = FileChannel.open(file.localFile(), StandardOpenOption.WRITE, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+            } catch (IOException ioe) {
+                result.completeExceptionally(ioe);
+                subscription.cancel();
+                return;
+            }
+            subscription.request(1);
+        }
+
+        @Override
+        public void onNext(List<ByteBuffer> items) {
+            for (var buf : items) {
+                fullBuf.writeBytes(buf);
+                buf.clear();
+            }
+
+            subscription.request(1);
+        }
+
+        @Override
+        public void onError(Throwable e) {
+            result.completeExceptionally(e);
+            close();
+        }
+
+        @Override
+        public void onComplete() {
+            try (
+                    var inStream = decompressor.apply(new ByteBufInputStream(fullBuf));
+                    var outStream = Channels.newOutputStream(out)
+            ) {
+                var transferred = inStream.transferTo(outStream);
+                LOGGER.debug("Received {}/{} bytes for {}", transferred, file.size(), file.relativeDownloadPath());
+            } catch (IOException ex) {
+                close();
+                subscription.cancel();
+                result.completeExceptionally(ex);
+            }
+
+            close();
+
+            result.complete(file.localFile());
+        }
+
+        @Override
+        public CompletionStage<Path> getBody() {
+            return result;
+        }
+
+        private void close() {
+            try {
+                out.close();
+            } catch (IOException ignored) {}
+        }
     }
 
     record FileToDownload(String relativeUrl, String relativeDownloadPath, Path localFile, long size, HashCode checksum) {

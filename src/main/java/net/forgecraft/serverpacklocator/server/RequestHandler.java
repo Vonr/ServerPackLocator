@@ -1,19 +1,30 @@
 package net.forgecraft.serverpacklocator.server;
 
-import net.forgecraft.serverpacklocator.ModAccessor;
-import net.forgecraft.serverpacklocator.secure.IConnectionSecurityManager;
 import io.netty.buffer.ByteBuf;
+import io.netty.buffer.ByteBufOutputStream;
 import io.netty.buffer.Unpooled;
 import io.netty.channel.ChannelHandlerContext;
-import io.netty.channel.DefaultFileRegion;
 import io.netty.channel.SimpleChannelInboundHandler;
-import io.netty.handler.codec.http.*;
+import io.netty.handler.codec.http.DefaultFullHttpResponse;
+import io.netty.handler.codec.http.FullHttpRequest;
+import io.netty.handler.codec.http.FullHttpResponse;
+import io.netty.handler.codec.http.HttpHeaderNames;
+import io.netty.handler.codec.http.HttpMethod;
+import io.netty.handler.codec.http.HttpResponseStatus;
+import io.netty.handler.codec.http.HttpUtil;
+import io.netty.handler.codec.http.HttpVersion;
+import net.forgecraft.serverpacklocator.ModAccessor;
+import net.forgecraft.serverpacklocator.secure.IConnectionSecurityManager;
+import net.forgecraft.serverpacklocator.utils.CompressionUtils;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 import javax.net.ssl.SSLException;
+import java.io.IOException;
+import java.io.OutputStream;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.util.Objects;
 
 class RequestHandler extends SimpleChannelInboundHandler<FullHttpRequest> {
@@ -106,15 +117,46 @@ class RequestHandler extends SimpleChannelInboundHandler<FullHttpRequest> {
     }
 
     private void buildFileReply(final ChannelHandlerContext ctx, final FullHttpRequest msg, final ServerFileManager.ExposedFile file) {
-        final HttpResponse response = new DefaultHttpResponse(HttpVersion.HTTP_1_1, HttpResponseStatus.OK);
+        ByteBuf content = Unpooled.buffer();
+
+        var usedEncodingsStr = "";
+        try (OutputStream contentStream = new ByteBufOutputStream(content)) {
+            var out = contentStream;
+            var acceptedEncodings = msg.headers().get("Accept-Encoding", "").split(",");
+            var usedEncodings = new StringBuilder();
+            for (var accepted : acceptedEncodings) {
+                var method = CompressionUtils.methodFromName(accepted.trim());
+                if (method != null) {
+                    out = method.compress(out);
+                    if (!usedEncodings.isEmpty()) {
+                        usedEncodings.append(',');
+                    }
+                    usedEncodings.append(method.name());
+                }
+            }
+
+            try (var fileStream = Files.newInputStream(file.path())) {
+                fileStream.transferTo(out);
+            }
+
+            usedEncodingsStr = usedEncodings.toString();
+            out.flush();
+            out.close();
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+
+        LOGGER.debug("Sending {} with {} compression ({} -> {} bytes)", file.name(), usedEncodingsStr.isEmpty() ? "no" : usedEncodingsStr, file.size(), content.writerIndex());
+
+        final FullHttpResponse response = new DefaultFullHttpResponse(HttpVersion.HTTP_1_1, HttpResponseStatus.OK, content);
         HttpUtil.setKeepAlive(response, HttpUtil.isKeepAlive(msg));
         response.headers().set(HttpHeaderNames.CONTENT_TYPE, "application/octet-stream");
         response.headers().set("filename", file.name());
-        HttpUtil.setContentLength(response, file.size());
-        this.connectionSecurityManager.decorateServerResponse(ctx, msg, response);
+        if (!usedEncodingsStr.isEmpty()) {
+            response.headers().set("Content-Encoding", usedEncodingsStr);
+        }
+        HttpUtil.setContentLength(response, content.writerIndex());
 
-        ctx.write(response);
-        ctx.write(new DefaultFileRegion(file.path().toFile(), 0, file.size()));
-        ctx.writeAndFlush(LastHttpContent.EMPTY_LAST_CONTENT);
+        ctx.writeAndFlush(response);
     }
 }
