@@ -5,8 +5,6 @@ import org.jetbrains.annotations.NotNull;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
-import java.nio.channels.Channels;
-import java.nio.channels.SeekableByteChannel;
 import java.util.zip.GZIPInputStream;
 import java.util.zip.GZIPOutputStream;
 
@@ -18,15 +16,7 @@ public class CompressionUtils {
 
         public abstract @NotNull InputStream decompress(InputStream input) throws IOException;
 
-        public @NotNull InputStream decompress(SeekableByteChannel input) throws IOException {
-            return this.decompress(Channels.newInputStream(input));
-        }
-
         public abstract @NotNull OutputStream compress(OutputStream input) throws IOException;
-
-        public @NotNull OutputStream compress(SeekableByteChannel input) throws IOException {
-            return this.compress(Channels.newOutputStream(input));
-        }
     }
 
     public static class Gzip extends CompressionMethod {
