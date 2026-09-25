@@ -3,6 +3,7 @@ package net.forgecraft.serverpacklocator.client;
 import net.forgecraft.serverpacklocator.FileChecksumValidator;
 import net.forgecraft.serverpacklocator.ServerManifest;
 import net.forgecraft.serverpacklocator.secure.IConnectionSecurityManager;
+import net.forgecraft.serverpacklocator.utils.CompressionUtils;
 import net.neoforged.fml.loading.ImmediateWindowHandler;
 import net.neoforged.fml.loading.progress.StartupNotificationManager;
 import org.apache.commons.lang3.mutable.MutableLong;
@@ -12,6 +13,7 @@ import org.apache.logging.log4j.Logger;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.net.URI;
 import java.net.URLEncoder;
 import java.net.http.HttpClient;
@@ -104,6 +106,7 @@ public class MultiThreadedDownloader {
         if (authenticated) {
             this.connectionSecurityManager.authenticateConnection(requestBuilder);
         }
+        requestBuilder.header("Accept-Encoding", "gzip");
         var request = requestBuilder.build();
         var response = httpClient.send(request, bodyHandler);
         response.headers().firstValue("Challenge").ifPresent(this::processChallengeString);
@@ -281,13 +284,34 @@ public class MultiThreadedDownloader {
 
         response.headers().firstValue("Challenge").ifPresent(this::processChallengeString);
 
-        var totalBytes = response.headers().firstValueAsLong("Content-Length").orElse(fileToDownload.size());
+        InputStream body = response.body();
+        var encoding = response.headers().firstValue("Content-Encoding").orElse(null);
+        if (encoding != null) {
+            var methodNames = encoding.split(",");
+            for (int i = methodNames.length - 1; i >= 0; i--) {
+                var method = CompressionUtils.methodFromName(methodNames[i].trim());
+                if (method != null) {
+                    try {
+                        body = method.decompress(body);
+                    } catch (IOException e) {
+                        throw new RuntimeException(e);
+                    }
+                }
+            }
+        }
 
         try (var outputStream = new FileOutputStream(file); var download = outputStream.getChannel();
-             ReadableByteChannel channel = Channels.newChannel(response.body())) {
-            while ((download.transferFrom(channel, file.length(), 8192)) > 0) {
-                progressListener.onProgress(file.length(), totalBytes);
+             ReadableByteChannel channel = Channels.newChannel(body)) {
+            var totalTransferred = 0;
+            while (true) {
+                var transferred = download.transferFrom(channel, file.length(), 8192);
+                if (transferred <= 0) {
+                    break;
+                }
+                totalTransferred += transferred;
+                progressListener.onProgress(file.length(), fileToDownload.size());
             }
+            LOGGER.debug("Received {}/{} bytes for {}", totalTransferred, fileToDownload.size(), fileToDownload.relativeDownloadPath());
         } catch (IOException e) {
             // Re-wrap the IO exception to give information about which path failed
             throw new IOException("Download of " + path + " failed: " + e, e);

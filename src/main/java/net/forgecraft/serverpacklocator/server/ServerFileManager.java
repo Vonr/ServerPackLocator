@@ -7,6 +7,7 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 import java.io.IOException;
+import java.nio.channels.SeekableByteChannel;
 import java.nio.file.FileSystem;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -33,14 +34,14 @@ public class ServerFileManager {
         return manifest;
     }
 
-    byte[] findFile(final String fileName) {
+    SeekableByteChannel findFile(final String fileName) {
         if (!exposedFiles.contains(fileName)) {
             LOGGER.warn("Attempt to access non-exposed file {}", fileName);
             return null;
         }
 
         try {
-            return Files.readAllBytes(serverSidedPackHandler.getGameDir().resolve(fileName));
+            return Files.newByteChannel(serverSidedPackHandler.getGameDir().resolve(fileName));
         } catch (IOException e) {
             LOGGER.warn("Failed to read file {}", fileName);
             return null;
