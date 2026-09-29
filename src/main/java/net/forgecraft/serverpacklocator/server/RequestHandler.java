@@ -1,29 +1,27 @@
 package net.forgecraft.serverpacklocator.server;
 
 import io.netty.buffer.ByteBuf;
+import io.netty.buffer.ByteBufOutputStream;
 import io.netty.buffer.Unpooled;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.SimpleChannelInboundHandler;
 import io.netty.handler.codec.http.DefaultFullHttpResponse;
-import io.netty.handler.codec.http.DefaultHttpResponse;
 import io.netty.handler.codec.http.FullHttpRequest;
 import io.netty.handler.codec.http.FullHttpResponse;
-import io.netty.handler.codec.http.HttpChunkedInput;
 import io.netty.handler.codec.http.HttpHeaderNames;
-import io.netty.handler.codec.http.HttpHeaderValues;
 import io.netty.handler.codec.http.HttpMethod;
-import io.netty.handler.codec.http.HttpResponse;
 import io.netty.handler.codec.http.HttpResponseStatus;
 import io.netty.handler.codec.http.HttpUtil;
 import io.netty.handler.codec.http.HttpVersion;
-import io.netty.handler.stream.ChunkedStream;
 import net.forgecraft.serverpacklocator.ModAccessor;
 import net.forgecraft.serverpacklocator.secure.IConnectionSecurityManager;
+import net.forgecraft.serverpacklocator.utils.CompressionUtils;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 import javax.net.ssl.SSLException;
 import java.io.IOException;
+import java.io.OutputStream;
 import java.net.URLDecoder;
 import java.nio.channels.Channels;
 import java.nio.channels.SeekableByteChannel;
@@ -130,20 +128,39 @@ class RequestHandler extends SimpleChannelInboundHandler<FullHttpRequest> {
     }
 
     private void buildFileReply(final ChannelHandlerContext ctx, final FullHttpRequest msg, final String fileName, final SeekableByteChannel file) throws IOException {
-        try (var fileStream = Channels.newInputStream(file)) {
-            var out = new HttpChunkedInput(new ChunkedStream(fileStream));
+        ByteBuf content = ctx.alloc().ioBuffer();
+        OutputStream contentStream = new ByteBufOutputStream(content);
 
-            final HttpResponse response = new DefaultHttpResponse(HttpVersion.HTTP_1_1, HttpResponseStatus.OK);
-            HttpUtil.setKeepAlive(response, HttpUtil.isKeepAlive(msg));
-            response.headers().set(HttpHeaderNames.CONTENT_TYPE, "application/octet-stream");
-            response.headers().set("filename", fileName);
-            response.headers().set(HttpHeaderNames.TRANSFER_ENCODING, HttpHeaderValues.CHUNKED);
-            this.connectionSecurityManager.onServerResponse(ctx, msg, response);
-
-            ctx.write(response);
-            ctx.writeAndFlush(out);
-        } catch (IOException e) {
-            throw new RuntimeException(e);
+        var acceptedEncodings = msg.headers().get("Accept-Encoding").split(",");
+        var usedEncodings = new StringBuilder();
+        for (var accepted : acceptedEncodings) {
+            var method = CompressionUtils.methodFromName(accepted.trim());
+            if (method != null) {
+                contentStream = method.compress(contentStream);
+                if (!usedEncodings.isEmpty()) {
+                    usedEncodings.append(',');
+                }
+                usedEncodings.append(method.name());
+            }
         }
+        var usedEncodingsStr = usedEncodings.toString();
+
+        Channels.newInputStream(file).transferTo(contentStream);
+        contentStream.flush();
+        contentStream.close();
+
+        LOGGER.debug("Sending {} with {} compression ({} -> {} bytes)", fileName, usedEncodingsStr.isEmpty() ? "no" : usedEncodingsStr, file.size(), content.writerIndex());
+
+        FullHttpResponse resp = new DefaultFullHttpResponse(HttpVersion.HTTP_1_1, HttpResponseStatus.OK, content);
+        HttpUtil.setKeepAlive(resp, HttpUtil.isKeepAlive(msg));
+        resp.headers().set(HttpHeaderNames.CONTENT_TYPE, "application/octet-stream");
+        resp.headers().set("filename", fileName);
+        if (!usedEncodingsStr.isEmpty()) {
+            resp.headers().set("Content-Encoding", usedEncodingsStr);
+        }
+        HttpUtil.setContentLength(resp, content.writerIndex());
+
+        this.connectionSecurityManager.onServerResponse(ctx, msg, resp);
+        ctx.writeAndFlush(resp);
     }
 }

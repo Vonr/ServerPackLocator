@@ -5,22 +5,24 @@ import com.mojang.authlib.yggdrasil.ServicesKeySet;
 import com.mojang.authlib.yggdrasil.ServicesKeyType;
 import com.mojang.authlib.yggdrasil.YggdrasilAuthenticationService;
 import com.mojang.authlib.yggdrasil.response.KeyPairResponse;
+import net.forgecraft.serverpacklocator.ConfigException;
+import net.forgecraft.serverpacklocator.LaunchEnvironmentHandler;
+import net.forgecraft.serverpacklocator.utils.NonceUtils;
 import cpw.mods.modlauncher.ArgumentHandler;
 import cpw.mods.modlauncher.Launcher;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.handler.codec.http.FullHttpRequest;
+import io.netty.handler.codec.http.FullHttpResponse;
 import io.netty.handler.codec.http.HttpHeaders;
-import io.netty.handler.codec.http.HttpResponse;
-import net.forgecraft.serverpacklocator.LaunchEnvironmentHandler;
-import net.forgecraft.serverpacklocator.utils.NonceUtils;
 import net.neoforged.api.distmarker.Dist;
-import org.apache.http.client.methods.RequestBuilder;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 import javax.annotation.Nullable;
 import java.lang.reflect.Field;
 import java.net.Proxy;
+import java.net.URLConnection;
+import java.net.http.HttpRequest;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
@@ -238,20 +240,20 @@ public final class ProfileKeyPairBasedSecurityManager implements IConnectionSecu
     }
 
     @Override
-    public void onClientConnectionCreation(RequestBuilder requestBuilder)
+    public void onClientConnectionCreation(HttpRequest.Builder requestBuilder)
     {
         if (signingHandler == null || sessionId.compareTo(DEFAULT_NILL_UUID) == 0) {
             LOGGER.warn("No signing handler is available for the current session (Missing keypair). Stuff might not work since we can not sign the requests!");
             return;
         }
 
-        requestBuilder.setHeader("Authentication", "SignedId");
-        requestBuilder.setHeader("AuthenticationId", sessionId.toString());
-        requestBuilder.setHeader("AuthenticationSignature", sign(sessionId, signingHandler.signer()));
-        requestBuilder.setHeader("AuthenticationKey", Base64.getEncoder().encodeToString(Crypt.rsaPublicKeyToString(signingHandler.keyPair().publicKeyData().key()).getBytes(StandardCharsets.UTF_8)));
-        requestBuilder.setHeader("AuthenticationKeyExpire", Base64.getEncoder().encodeToString(signingHandler.keyPair().publicKeyData().expiresAt().toString().getBytes(StandardCharsets.UTF_8)));
-        requestBuilder.setHeader("AuthenticationKeyExpireDigest", sign(signingHandler.keyPair().publicKeyData().expiresAt().toString(), signingHandler.signer()));
-        requestBuilder.setHeader("AuthenticationKeySignature", Base64.getEncoder().encodeToString(signingHandler.keyPair().publicKeyData().publicKeySignature()));
+        requestBuilder.header("Authentication", "SignedId");
+        requestBuilder.header("AuthenticationId", sessionId.toString());
+        requestBuilder.header("AuthenticationSignature", sign(sessionId, signingHandler.signer()));
+        requestBuilder.header("AuthenticationKey", Base64.getEncoder().encodeToString(Crypt.rsaPublicKeyToString(signingHandler.keyPair().publicKeyData().key()).getBytes(StandardCharsets.UTF_8)));
+        requestBuilder.header("AuthenticationKeyExpire", Base64.getEncoder().encodeToString(signingHandler.keyPair().publicKeyData().expiresAt().toString().getBytes(StandardCharsets.UTF_8)));
+        requestBuilder.header("AuthenticationKeyExpireDigest", sign(signingHandler.keyPair().publicKeyData().expiresAt().toString(), signingHandler.signer()));
+        requestBuilder.header("AuthenticationKeySignature", Base64.getEncoder().encodeToString(signingHandler.keyPair().publicKeyData().publicKeySignature()));
     }
 
     @Override
@@ -260,8 +262,8 @@ public final class ProfileKeyPairBasedSecurityManager implements IConnectionSecu
     }
 
     @Override
-    public void authenticateConnection(RequestBuilder requestBuilder) {
-        requestBuilder.setHeader("ChallengeSignature", this.challengePayload);
+    public void authenticateConnection(HttpRequest.Builder requestBuilder) {
+        requestBuilder.header("ChallengeSignature", this.challengePayload);
     }
 
     @Override
@@ -436,7 +438,7 @@ public final class ProfileKeyPairBasedSecurityManager implements IConnectionSecu
     }
 
     @Override
-    public void onServerResponse(ChannelHandlerContext ctx, io.netty.handler.codec.http.HttpRequest msg, HttpResponse resp) {
+    public void onServerResponse(ChannelHandlerContext ctx, FullHttpRequest msg, FullHttpResponse resp) {
         final String challenge = NonceUtils.createNonce();
 
         final UUID sessionId = getSessionId(msg.headers());
