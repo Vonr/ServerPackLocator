@@ -128,7 +128,7 @@ class RequestHandler extends SimpleChannelInboundHandler<FullHttpRequest> {
     }
 
     private void buildFileReply(final ChannelHandlerContext ctx, final FullHttpRequest msg, final String fileName, final SeekableByteChannel file) throws IOException {
-        ByteBuf content = Unpooled.buffer();
+        ByteBuf content = ctx.alloc().ioBuffer();
         OutputStream contentStream = new ByteBufOutputStream(content);
 
         var acceptedEncodings = msg.headers().get("Accept-Encoding").split(",");
