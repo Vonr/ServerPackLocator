@@ -67,10 +67,35 @@ public class MultiThreadedDownloader {
         authenticate();
         var progressBar = StartupNotificationManager.addProgressBar("Requesting server manifest...", 1);
         try {
-            var response = makeRequest("servermanifest.json", true, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+            var response = makeRequest("servermanifest.json", true, responseInfo -> HttpResponse.BodySubscribers.mapping(HttpResponse.BodySubscribers.ofInputStream(), in -> {
+                Function<InputStream, InputStream> decompressor = s -> s;
+                var encoding = responseInfo.headers().firstValue("Content-Encoding").orElse(null);
+                if (encoding != null) {
+                    var methodNames = encoding.split(",");
+                    for (int i = methodNames.length - 1; i >= 0; i--) {
+                        var method = CompressionUtils.methodFromName(methodNames[i].trim());
+                        if (method != null) {
+                            decompressor = decompressor.andThen(s -> {
+                                try {
+                                    return method.decompress(s);
+                                } catch (IOException e) {
+                                    LOGGER.error(e);
+                                    throw new RuntimeException(e);
+                                }
+                            });
+                        }
+                    }
+                }
+
+                return decompressor.apply(in);
+            }));
+
             this.connectionSecurityManager.handleClientResponse(response);
 
-            var serverManifest = ServerManifest.fromString(response.body());
+            ServerManifest serverManifest;
+            try (var stream = response.body()) {
+                serverManifest = ServerManifest.fromString(String.valueOf(StandardCharsets.UTF_8.decode(ByteBuffer.wrap(stream.readAllBytes()))));
+            }
 
             // Write the file to the client system for debugging
             if (serverManifest != null) {
