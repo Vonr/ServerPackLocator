@@ -1,15 +1,16 @@
 package net.forgecraft.serverpacklocator.secure;
 
-import net.forgecraft.serverpacklocator.ConfigException;
-import net.forgecraft.serverpacklocator.utils.NonceUtils;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.handler.codec.http.FullHttpRequest;
-import io.netty.handler.codec.http.FullHttpResponse;
+import io.netty.handler.codec.http.HttpRequest;
+import io.netty.handler.codec.http.HttpResponse;
+import net.forgecraft.serverpacklocator.ConfigException;
+import net.forgecraft.serverpacklocator.utils.NonceUtils;
+import org.apache.http.client.methods.RequestBuilder;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 import javax.annotation.Nullable;
-import java.net.http.HttpRequest;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
@@ -32,9 +33,9 @@ public final class PasswordBasedSecurityManager implements IConnectionSecurityMa
     }
 
     @Override
-    public void onClientConnectionCreation(HttpRequest.Builder requestBuilder)
+    public void onClientConnectionCreation(RequestBuilder requestBuilder)
     {
-        requestBuilder.header("Authentication", "Basic " + passwordHash);
+        requestBuilder.setHeader("Authentication", "Basic " + passwordHash);
     }
 
     @Override
@@ -87,7 +88,7 @@ public final class PasswordBasedSecurityManager implements IConnectionSecurityMa
     }
 
     @Override
-    public void onServerResponse(ChannelHandlerContext ctx, FullHttpRequest msg, FullHttpResponse resp) {
+    public void onServerResponse(ChannelHandlerContext ctx, HttpRequest msg, HttpResponse resp) {
         //We need to set a challenge for the client to respond to
         //However we do not validate it at all in this security mode.
         final String challenge = NonceUtils.createNonce();

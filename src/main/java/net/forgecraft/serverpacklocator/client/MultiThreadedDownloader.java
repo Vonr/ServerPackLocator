@@ -3,10 +3,14 @@ package net.forgecraft.serverpacklocator.client;
 import net.forgecraft.serverpacklocator.FileChecksumValidator;
 import net.forgecraft.serverpacklocator.ServerManifest;
 import net.forgecraft.serverpacklocator.secure.IConnectionSecurityManager;
-import net.forgecraft.serverpacklocator.utils.CompressionUtils;
 import net.neoforged.fml.loading.ImmediateWindowHandler;
 import net.neoforged.fml.loading.progress.StartupNotificationManager;
 import org.apache.commons.lang3.mutable.MutableLong;
+import org.apache.http.client.methods.CloseableHttpResponse;
+import org.apache.http.client.methods.RequestBuilder;
+import org.apache.http.impl.client.CloseableHttpClient;
+import org.apache.http.impl.client.HttpClientBuilder;
+import org.apache.http.util.EntityUtils;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -16,9 +20,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.net.URI;
 import java.net.URLEncoder;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
+import java.nio.ByteBuffer;
 import java.nio.channels.Channels;
 import java.nio.channels.ReadableByteChannel;
 import java.nio.charset.StandardCharsets;
@@ -37,14 +39,14 @@ public class MultiThreadedDownloader {
 
     private final ClientSidedPackHandler clientSidedPackHandler;
     private final IConnectionSecurityManager connectionSecurityManager;
-    private final HttpClient httpClient;
+    private final CloseableHttpClient httpClient;
     private final String remoteServer;
 
     public MultiThreadedDownloader(
             final ClientSidedPackHandler packHandler,
             final IConnectionSecurityManager connectionSecurityManager
     ) {
-        this.httpClient = HttpClient.newHttpClient();
+        this.httpClient = HttpClientBuilder.create().build();
         this.clientSidedPackHandler = packHandler;
         this.connectionSecurityManager = connectionSecurityManager;
         remoteServer = clientSidedPackHandler.getConfig().getClient().getRemoteServer();
@@ -53,7 +55,7 @@ public class MultiThreadedDownloader {
     private void authenticate() throws IOException, InterruptedException {
         var progressBar = StartupNotificationManager.addProgressBar("SPL is authenticating...", 1);
         try {
-            makeRequest("authenticate", false, HttpResponse.BodyHandlers.discarding());
+            makeRequest("authenticate", false).close();
         } finally {
             progressBar.complete();
         }
@@ -68,12 +70,15 @@ public class MultiThreadedDownloader {
     private PreparedServerDownloadData downloadManifest() throws IOException, InterruptedException {
         authenticate();
         var progressBar = StartupNotificationManager.addProgressBar("Requesting server manifest...", 1);
-        try {
-            var response = makeRequest("servermanifest.json", true, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+        ServerManifest serverManifest;
+        try (var response = makeRequest("servermanifest.json", true)) {
 
-            response.headers().firstValue("Challenge").ifPresent(this::processChallengeString);
+            var challenge = response.getFirstHeader("Challenge");
+            if (challenge != null) {
+                this.processChallengeString(challenge.getValue());
+            }
 
-            var serverManifest = ServerManifest.fromString(response.body());
+            serverManifest = ServerManifest.fromString(StandardCharsets.UTF_8.decode(ByteBuffer.wrap(response.getEntity().getContent().readAllBytes())).toString());
 
             // Write the file to the client system for debugging
             if (serverManifest != null) {
@@ -96,22 +101,25 @@ public class MultiThreadedDownloader {
         }
     }
 
-    private <T> HttpResponse<T> makeRequest(String path, boolean authenticated, HttpResponse.BodyHandler<T> bodyHandler) throws IOException, InterruptedException {
+    private CloseableHttpResponse makeRequest(String path, boolean authenticated) throws IOException, InterruptedException {
         var requestUri = joinUrl(remoteServer, path);
 
         LOGGER.info("ServerPackLocator is requesting {}...", requestUri);
 
-        var requestBuilder = HttpRequest.newBuilder(requestUri);
-        this.connectionSecurityManager.onClientConnectionCreation(requestBuilder);
+        var requestBuilder = RequestBuilder.get(requestUri);
+       this.connectionSecurityManager.onClientConnectionCreation(requestBuilder);
         if (authenticated) {
             this.connectionSecurityManager.authenticateConnection(requestBuilder);
         }
-        requestBuilder.header("Accept-Encoding", "gzip");
         var request = requestBuilder.build();
-        var response = httpClient.send(request, bodyHandler);
-        response.headers().firstValue("Challenge").ifPresent(this::processChallengeString);
-        if (response.statusCode() != 200) {
-            throw new IOException("Got HTTP Status Code " + response.statusCode() + " for " + requestUri);
+        var response = httpClient.execute(request);
+        var challenge = response.getFirstHeader("Challenge");
+        if (challenge != null) {
+            this.processChallengeString(challenge.getValue());
+        }
+
+        if (response.getStatusLine().getStatusCode() != 200) {
+            throw new IOException("Got HTTP Status Code " + response.getStatusLine().getStatusCode() + " for " + requestUri);
         }
         return response;
     }
@@ -277,44 +285,37 @@ public class MultiThreadedDownloader {
         LOGGER.info("Requesting file {}", nextFile);
         var path = "files/" + URLEncoder.encode(nextFile, StandardCharsets.UTF_8).replace("+", "%20");
 
-        var response = makeRequest(path, true, HttpResponse.BodyHandlers.ofInputStream());
+        File file;
+        try (var response = makeRequest(path, true)) {
 
-        File file = fileToDownload.localFile();
-        file.getParentFile().mkdirs();
+            file = fileToDownload.localFile();
+            file.getParentFile().mkdirs();
 
-        response.headers().firstValue("Challenge").ifPresent(this::processChallengeString);
+            var challenge = response.getFirstHeader("Challenge");
+            if (challenge != null) {
+                this.processChallengeString(challenge.getValue());
+            }
 
-        InputStream body = response.body();
-        var encoding = response.headers().firstValue("Content-Encoding").orElse(null);
-        if (encoding != null) {
-            var methodNames = encoding.split(",");
-            for (int i = methodNames.length - 1; i >= 0; i--) {
-                var method = CompressionUtils.methodFromName(methodNames[i].trim());
-                if (method != null) {
-                    try {
-                        body = method.decompress(body);
-                    } catch (IOException e) {
-                        throw new RuntimeException(e);
+            InputStream body = response.getEntity().getContent();
+
+            try (var outputStream = new FileOutputStream(file); var download = outputStream.getChannel();
+                 ReadableByteChannel channel = Channels.newChannel(body)) {
+                var totalTransferred = 0;
+                while (true) {
+                    var transferred = download.transferFrom(channel, file.length(), 8192);
+                    if (transferred <= 0) {
+                        break;
                     }
+                    totalTransferred += transferred;
+                    progressListener.onProgress(file.length(), fileToDownload.size());
                 }
+                LOGGER.debug("Received {}/{} bytes for {}", totalTransferred, fileToDownload.size(), fileToDownload.relativeDownloadPath());
+            } catch (IOException e) {
+                // Re-wrap the IO exception to give information about which path failed
+                throw new IOException("Download of " + path + " failed: " + e, e);
             }
-        }
 
-        try (var outputStream = new FileOutputStream(file); var download = outputStream.getChannel();
-             ReadableByteChannel channel = Channels.newChannel(body)) {
-            var totalTransferred = 0;
-            while (true) {
-                var transferred = download.transferFrom(channel, file.length(), 8192);
-                if (transferred <= 0) {
-                    break;
-                }
-                totalTransferred += transferred;
-                progressListener.onProgress(file.length(), fileToDownload.size());
-            }
-            LOGGER.debug("Received {}/{} bytes for {}", totalTransferred, fileToDownload.size(), fileToDownload.relativeDownloadPath());
-        } catch (IOException e) {
-            // Re-wrap the IO exception to give information about which path failed
-            throw new IOException("Download of " + path + " failed: " + e, e);
+            EntityUtils.consume(response.getEntity());
         }
 
         // Validate that the downloaded file actually matches the expected checksum

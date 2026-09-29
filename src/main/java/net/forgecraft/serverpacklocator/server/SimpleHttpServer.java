@@ -1,5 +1,7 @@
 package net.forgecraft.serverpacklocator.server;
 
+import io.netty.handler.codec.http.HttpContentCompressor;
+import io.netty.handler.stream.ChunkedWriteHandler;
 import net.forgecraft.serverpacklocator.secure.IConnectionSecurityManager;
 import io.netty.bootstrap.ServerBootstrap;
 import io.netty.channel.*;
@@ -46,6 +48,8 @@ public class SimpleHttpServer {
                     @Override
                     protected void initChannel(final SocketChannel ch) {
                         ch.pipeline().addLast("codec", new HttpServerCodec());
+                        ch.pipeline().addLast("deflater", new HttpContentCompressor());
+                        ch.pipeline().addLast("chunkedWriter", new ChunkedWriteHandler());
                         ch.pipeline().addLast("aggregator", new HttpObjectAggregator(2 << 19));
                         ch.pipeline().addLast("request", new RequestHandler(
                                 securityManager, fileManager
@@ -54,7 +58,7 @@ public class SimpleHttpServer {
                 })
                 .option(ChannelOption.SO_BACKLOG, 128)
                 .childOption(ChannelOption.SO_KEEPALIVE, true);
-        bootstrap.bind(port).syncUninterruptibly();
+        bootstrap.bind(port);
     }
 
     private static final AtomicInteger COUNT = new AtomicInteger(1);
