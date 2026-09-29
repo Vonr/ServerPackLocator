@@ -1,9 +1,6 @@
 package net.forgecraft.serverpacklocator.client;
 
 import com.google.common.hash.HashCode;
-import io.netty.buffer.ByteBuf;
-import io.netty.buffer.ByteBufInputStream;
-import io.netty.buffer.Unpooled;
 import net.forgecraft.serverpacklocator.FileChecksumValidator;
 import net.forgecraft.serverpacklocator.ServerManifest;
 import net.forgecraft.serverpacklocator.secure.IConnectionSecurityManager;
@@ -30,10 +27,8 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 import java.util.OptionalLong;
-import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.Flow;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Function;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
@@ -286,6 +281,7 @@ public class MultiThreadedDownloader {
                                     try {
                                         return method.decompress(s);
                                     } catch (IOException e) {
+                                        LOGGER.error(e);
                                         throw new RuntimeException(e);
                                     }
                                 });
@@ -293,9 +289,16 @@ public class MultiThreadedDownloader {
                         }
                     }
 
-                    int initialCapacity = (int) fileToDownload.size();
+                    var downstream = HttpResponse.BodySubscribers.mapping(HttpResponse.BodySubscribers.ofInputStream(), decompressor);
+                    return HttpResponse.BodySubscribers.mapping(downstream, s -> {
+                        try (var out = Channels.newOutputStream(FileChannel.open(fileToDownload.localFile(), StandardOpenOption.WRITE, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING))){
+                            s.transferTo(out);
+                        } catch (IOException e) {
+                            throw new RuntimeException(e);
+                        }
 
-                    return new CompressedFileSubscriber(fileToDownload, decompressor, initialCapacity);
+                        return fileToDownload.localFile();
+                    });
                 })
         );
 
@@ -355,94 +358,8 @@ public class MultiThreadedDownloader {
         void onProgress(long downloaded, long expectedSize);
     }
 
-    static class CompressedFileSubscriber implements HttpResponse.BodySubscriber<Path> {
-        /**
-         * Adapted from {@link jdk.internal.net.http.ResponseSubscribers.PathSubscriber}
-         */
-
-        private final FileToDownload file;
-        private final Function<InputStream, InputStream> decompressor;
-
-        private final ByteBuf fullBuf;
-        private final CompletableFuture<Path> result = new CompletableFuture<>();
-
-        private final AtomicBoolean subscribed = new AtomicBoolean();
-        private volatile Flow.Subscription subscription;
-        private volatile FileChannel out;
-
-        CompressedFileSubscriber(FileToDownload file, Function<InputStream, InputStream> decompressor, int initialCapacity) {
-            this.file = file;
-            this.decompressor = decompressor;
-            this.fullBuf = Unpooled.directBuffer(initialCapacity);
-        }
-
-        @Override
-        public void onSubscribe(Flow.Subscription subscription) {
-            Objects.requireNonNull(subscription);
-            if (!subscribed.compareAndSet(false, true)) {
-                subscription.cancel();
-                return;
-            }
-
-            this.subscription = subscription;
-            try {
-                out = FileChannel.open(file.localFile(), StandardOpenOption.WRITE, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
-            } catch (IOException ioe) {
-                result.completeExceptionally(ioe);
-                subscription.cancel();
-                return;
-            }
-            subscription.request(1);
-        }
-
-        @Override
-        public void onNext(List<ByteBuffer> items) {
-            for (var buf : items) {
-                fullBuf.writeBytes(buf);
-                buf.clear();
-            }
-
-            subscription.request(1);
-        }
-
-        @Override
-        public void onError(Throwable e) {
-            result.completeExceptionally(e);
-            close();
-        }
-
-        @Override
-        public void onComplete() {
-            try (
-                    var inStream = decompressor.apply(new ByteBufInputStream(fullBuf));
-                    var outStream = Channels.newOutputStream(out)
-            ) {
-                var transferred = inStream.transferTo(outStream);
-                LOGGER.debug("Received {}/{} bytes for {}", transferred, file.size(), file.relativeDownloadPath());
-            } catch (IOException ex) {
-                close();
-                subscription.cancel();
-                result.completeExceptionally(ex);
-            }
-
-            close();
-
-            result.complete(file.localFile());
-        }
-
-        @Override
-        public CompletionStage<Path> getBody() {
-            return result;
-        }
-
-        private void close() {
-            try {
-                out.close();
-            } catch (IOException ignored) {}
-        }
-    }
-
-    record FileToDownload(String relativeUrl, String relativeDownloadPath, Path localFile, long size, HashCode checksum) {
+    record FileToDownload(String relativeUrl, String relativeDownloadPath, Path localFile, long size,
+                          HashCode checksum) {
     }
 
     public record PreparedServerDownloadData(ServerManifest manifest,
