@@ -5,9 +5,7 @@ import net.forgecraft.serverpacklocator.FileChecksumValidator;
 import net.forgecraft.serverpacklocator.ServerManifest;
 import net.forgecraft.serverpacklocator.secure.IConnectionSecurityManager;
 import net.forgecraft.serverpacklocator.utils.CompressionUtils;
-import net.neoforged.fml.loading.ImmediateWindowHandler;
 import net.neoforged.fml.loading.progress.StartupNotificationManager;
-import org.apache.commons.lang3.mutable.MutableLong;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -26,7 +24,6 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
-import java.util.Base64;
 import java.util.List;
 import java.util.Objects;
 import java.util.OptionalLong;
@@ -55,6 +52,9 @@ public class MultiThreadedDownloader {
     }
 
     private void authenticate() throws IOException, InterruptedException {
+        if (!connectionSecurityManager.needsAuthRequest()) {
+            return;
+        }
         var progressBar = StartupNotificationManager.addProgressBar("SPL is authenticating...", 1);
         try {
             makeRequest("authenticate", false, HttpResponse.BodyHandlers.discarding());
@@ -63,21 +63,39 @@ public class MultiThreadedDownloader {
         }
     }
 
-    private void processChallengeString(String challengeStr) {
-        LOGGER.info("Got Challenge {}", challengeStr);
-        var challenge = Base64.getDecoder().decode(challengeStr);
-        this.connectionSecurityManager.onAuthenticateComplete(new String(challenge, StandardCharsets.UTF_8));
-    }
-
     private PreparedServerDownloadData downloadManifest() throws IOException, InterruptedException {
         authenticate();
         var progressBar = StartupNotificationManager.addProgressBar("Requesting server manifest...", 1);
         try {
-            var response = makeRequest("servermanifest.json", true, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+            var response = makeRequest("servermanifest.json", true, responseInfo -> HttpResponse.BodySubscribers.mapping(HttpResponse.BodySubscribers.ofInputStream(), in -> {
+                Function<InputStream, InputStream> decompressor = s -> s;
+                var encoding = responseInfo.headers().firstValue("Content-Encoding").orElse(null);
+                if (encoding != null) {
+                    var methodNames = encoding.split(",");
+                    for (int i = methodNames.length - 1; i >= 0; i--) {
+                        var method = CompressionUtils.methodFromName(methodNames[i].trim());
+                        if (method != null) {
+                            decompressor = decompressor.andThen(s -> {
+                                try {
+                                    return method.decompress(s);
+                                } catch (IOException e) {
+                                    LOGGER.error(e);
+                                    throw new RuntimeException(e);
+                                }
+                            });
+                        }
+                    }
+                }
 
-            response.headers().firstValue("Challenge").ifPresent(this::processChallengeString);
+                return decompressor.apply(in);
+            }));
 
-            var serverManifest = ServerManifest.fromString(response.body());
+            this.connectionSecurityManager.handleClientResponse(response);
+
+            ServerManifest serverManifest;
+            try (var stream = response.body()) {
+                serverManifest = ServerManifest.fromString(String.valueOf(StandardCharsets.UTF_8.decode(ByteBuffer.wrap(stream.readAllBytes()))));
+            }
 
             // Write the file to the client system for debugging
             if (serverManifest != null) {
@@ -105,15 +123,11 @@ public class MultiThreadedDownloader {
 
         LOGGER.info("ServerPackLocator is requesting {}...", requestUri);
 
-        var requestBuilder = HttpRequest.newBuilder(requestUri);
-        this.connectionSecurityManager.onClientConnectionCreation(requestBuilder);
-        if (authenticated) {
-            this.connectionSecurityManager.authenticateConnection(requestBuilder);
-        }
-        requestBuilder.header("Accept-Encoding", "gzip");
-        var request = requestBuilder.build();
-        var response = httpClient.send(request, bodyHandler);
-        response.headers().firstValue("Challenge").ifPresent(this::processChallengeString);
+        var request = HttpRequest.newBuilder(requestUri);
+        request.header("Accept-Encoding", "gzip");
+        this.connectionSecurityManager.decorateClientRequest(request, authenticated);
+        var response = httpClient.send(request.build(), bodyHandler);
+        this.connectionSecurityManager.handleClientResponse(response);
         if (response.statusCode() != 200) {
             throw new IOException("Got HTTP Status Code " + response.statusCode() + " for " + requestUri);
         }
@@ -148,14 +162,9 @@ public class MultiThreadedDownloader {
                 for (var fileToDownload : filesToDownload) {
                     var bytesDownloadedAtStartOfFile = bytesDownloaded;
                     progressBar.setAbsolute(toDownloadProgress(bytesDownloadedAtStartOfFile));
-                    MutableLong lastRenderTick = new MutableLong(System.currentTimeMillis());
                     progressBar.label("Downloading " + fileToDownload.localFile.getFileName().toString() + "...");
                     downloadFile(fileToDownload, (downloaded, total) -> {
                         progressBar.setAbsolute(toDownloadProgress(bytesDownloadedAtStartOfFile + downloaded));
-                        if (System.currentTimeMillis() - lastRenderTick.getValue() >= 50L) {
-                            ImmediateWindowHandler.renderTick();
-                            lastRenderTick.setValue(System.currentTimeMillis());
-                        }
                     });
                     // The original estimate was based on this, and the progress bar should reflect it
                     // even if the server sent a different size
@@ -381,4 +390,3 @@ public class MultiThreadedDownloader {
                                              List<ClientConfig.DownloadedServerContent> directoryContent) {
     }
 }
-
