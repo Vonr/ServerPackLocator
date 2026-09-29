@@ -117,7 +117,7 @@ class RequestHandler extends SimpleChannelInboundHandler<FullHttpRequest> {
     }
 
     private void buildFileReply(final ChannelHandlerContext ctx, final FullHttpRequest msg, final ServerFileManager.ExposedFile file) {
-        ByteBuf content = Unpooled.directBuffer();
+        ByteBuf content = ctx.alloc().ioBuffer();
 
         var usedEncodingsStr = "";
         try (OutputStream contentStream = new ByteBufOutputStream(content)) {
