@@ -358,8 +358,7 @@ public class MultiThreadedDownloader {
         void onProgress(long downloaded, long expectedSize);
     }
 
-    record FileToDownload(String relativeUrl, String relativeDownloadPath, Path localFile, long size,
-                          HashCode checksum) {
+    record FileToDownload(String relativeUrl, String relativeDownloadPath, Path localFile, long size, HashCode checksum) {
     }
 
     public record PreparedServerDownloadData(ServerManifest manifest,
